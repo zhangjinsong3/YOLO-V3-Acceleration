@@ -1,0 +1,8 @@
+#! /bin/bash
+
+result=test.txt
+a=0.45
+b=0.003
+mAP=`python test.py 3.0 2>&1 1>/dev/null`
+echo $( printf '%f %f %f' ${a} ${b} ${mAP}) >> ${result}
+cat ${result}

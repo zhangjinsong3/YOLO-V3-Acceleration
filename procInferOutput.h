@@ -1,0 +1,229 @@
+#include "regionLayer.h"
+#include "bboxParser.h"
+
+#ifdef VISULIZATION
+#include "draw.h"
+#endif
+
+#define zoomFactor 2
+#define nOutputLayer 3
+double procInferOutput_yolov2(INFER_OUTPUT_PARAMS * pInferOutputParams, image im, std::vector<std::string>& vSynsets, std::string output, const std::string imageIndex, float nmsThreshold, float confThreshold)
+{
+    double t = 0;
+    StopWatch timer;
+
+    // get output from yolov3
+		DimsCHW dim = pInferOutputParams->vOutputDims_[0];
+#ifdef VOC
+    int net_width = 416;
+    int net_height = 416;
+    float nms_thresh = nmsThreshold; //0.3f
+    float prob_thresh = confThreshold;
+    float anchors[] = {3.625, 2.8125, 4.875, 6.1875, 11.65625, 10.1875, 1.875, 3.8125, 3.875, 2.8125, 3.6875, 7.4375, 1.25, 1.625, 2., 3.75, 4.125, 2.875};
+    regionParams l0;
+    l0.classes = 20;
+    l0.n = 3;
+    l0.coords = 4;
+    l0.w = dim.w();
+    l0.h = dim.h();
+    l0.outputs = dim.c() * dim.h() * dim.w();
+    l0.softmax = 1;
+    l0.background = 0;
+#endif
+    const int nCells = (l0.w*l0.h + \
+									zoomFactor*zoomFactor*l0.w*l0.h + \
+									zoomFactor*zoomFactor*zoomFactor*zoomFactor*l0.w*l0.h);
+		const int nBatchSize  = pInferOutputParams->nBatchSize_;
+		const long nData = (long)nBatchSize*l0.n*(l0.coords + 1 + l0.classes)*nCells;
+		// float* __constant__ * dpData_unordered;
+		float** dpData_unordered;
+		ck(cudaMalloc((void**)&dpData_unordered, nOutputLayer*sizeof(float *)));
+		float* _tmp[nOutputLayer] = {nullptr};
+		for(int nO = 0; nO < nOutputLayer; ++nO){ // the conv81, 93, 105 layers locate in idx 0, 1, 2
+		    _tmp[nO] = pInferOutputParams->vpInferResults_[nO];
+		}
+		// cudaMemcpyToSymbol(dpData_unordered, _tmp, nOutputLayer*sizeof(float *), cudaMemcpyHostToDevice);
+		cudaMemcpy(dpData_unordered, _tmp, nOutputLayer*sizeof(float *), cudaMemcpyHostToDevice);
+
+    // pre-allocate resource
+    cudaStream_t stream;
+    ck(cudaStreamCreate(&stream));
+
+    // reorgnize output from yolov3
+    float *dpData;
+    ck(cudaMalloc((void**)&dpData, nData*sizeof(float)));
+		reorgOutput_gpu(nBatchSize, l0.classes, l0.n, l0.coords, l0.w, l0.h, nCells, dpData_unordered, dpData, nData, stream);
+		
+    // bboxes and probs
+    box *bboxes;
+    ck(cudaMalloc((void**)&bboxes, nBatchSize*l0.n*nCells*sizeof(box)));
+    float *probes;
+    ck(cudaMalloc((void**)&probes, nBatchSize*l0.n*nCells*l0.classes*sizeof(float))); 
+
+    // split data
+#define nAnchors (3*(2*3))
+    float *dAnchors;
+    ck(cudaMalloc((void**)&dAnchors, nAnchors*sizeof(float)));
+    ck(cudaMemcpy(dAnchors, anchors, nAnchors*sizeof(float), cudaMemcpyHostToDevice));
+
+    // temporary storage
+    size_t workspaceSizeInByte = getWorkspaceSizeInByte(nBatchSize, l0.classes, l0.n, nCells);
+    void * workspace;
+    ck(cudaMalloc((void**)&workspace, workspaceSizeInByte));
+
+    // sort bboxes per classes
+    int *sorted_boxIdx;
+    ck(cudaMalloc((void**)&sorted_boxIdx, nBatchSize*l0.n*nCells*l0.classes*sizeof(int)));
+
+    // nms for all classes
+    float *afterNMS_probes;
+    int * afterNMS_indexes;
+    ck(cudaMalloc((void**)&afterNMS_probes, nBatchSize*l0.n*nCells*l0.classes*sizeof(float)));
+    ck(cudaMalloc((void**)&afterNMS_indexes, nBatchSize*l0.n*nCells*l0.classes*sizeof(int)));
+
+    // sort bboxes per image
+    int *boxIdx;
+    ck(cudaMalloc((void**)&boxIdx, nBatchSize*l0.n*nCells*l0.classes*sizeof(int)));
+
+
+    timer.Start();
+#if 1 // DEBUG
+    float *hpData;
+		cudaHostAlloc(&hpData, nData*sizeof(float), cudaHostAllocDefault);
+		cudaMemcpyAsync(hpData, dpData, nData*sizeof(float), cudaMemcpyDeviceToHost, stream);
+		ck(cudaDeviceSynchronize());
+		printf("[before]\n");
+		for(int loc = 0; loc < 5; ++loc){
+		  printf("#%d:\t", loc);
+		  for(int c = 0; c < l0.coords + 1 + l0.classes; ++c){
+		    printf("%.2f, ", hpData[c*nCells + loc]);
+		  }
+		  printf("\n");
+		}
+		cudaFreeHost(hpData);
+#endif
+    // 1. prepare cuda memory (bound x,y,conf + softmax classes)
+    regionLayer_gpu(nBatchSize, dim.c(), nCells, l0.n, l0.coords, l0.classes, dpData, dpData, stream);
+    
+#if 1 // DEBUG
+    float *hpData2;
+		cudaHostAlloc(&hpData2, nData*sizeof(float), cudaHostAllocDefault);
+		cudaMemcpyAsync(hpData2, dpData, nData*sizeof(float), cudaMemcpyDeviceToHost, stream);
+		ck(cudaDeviceSynchronize());
+		printf("[bound x,y,conf + softmax classes]\n");
+		for(int loc = 0; loc < 5; ++loc){
+		  printf("#%d:\t", loc);
+		  for(int c = 0; c < l0.coords + 1 + l0.classes; ++c){
+		    printf("%.2f, ", hpData2[c*nCells + loc]);
+		  }
+		  printf("\n");
+		}
+		cudaFreeHost(hpData2);
+		cudaStreamDestroy(stream);
+		exit(0);
+#endif
+
+    // 2. split data into boxes and probes (relative coord + conf*prob)
+    splitOutputData_gpu(nBatchSize, l0.classes, l0.n, l0.coords, l0.w, l0.h, nCells, l0.background, false, prob_thresh, dpData, dAnchors, probes, bboxes, stream);
+    
+    // 3. correct bbox (abs-coord in original img)
+    correct_region_boxes_gpu(nBatchSize, l0.classes, l0.n, nCells, im.w, im.h, net_width, net_height, bboxes, stream);
+
+    // 4. sort bboxes per classes
+    sortScoresPerClass_gpu(nBatchSize, l0.classes, l0.n*nCells, probes, sorted_boxIdx, workspace, workspaceSizeInByte, stream);
+
+    // 5. nms for all classes
+    allClassNMS_gpu(nBatchSize, l0.classes, l0.n, nCells, nms_thresh, (void*)bboxes, (void*)probes, (void*)afterNMS_probes, (void*)sorted_boxIdx, (void*)afterNMS_indexes, stream);
+
+    // 6. sort bboxes per image
+    sortScoresPerImage_gpu(nBatchSize, nCells*l0.n*l0.classes, afterNMS_probes, afterNMS_indexes, probes, boxIdx, workspace, workspaceSizeInByte, stream);
+    // after this, the boxes (n*h*w*classes) are sorted, as well as the probes. if you want the box, use boxIdx % l0.n*h*w to get.
+
+    ck(cudaDeviceSynchronize());
+    t = timer.Stop();
+
+    // copy data back to cpu for output
+    float * probes_cpu  = (float*)malloc(nBatchSize*nCells*l0.n*l0.classes*sizeof(float));
+    int * boxIdx_cpu    = (int*)malloc(nBatchSize*nCells*l0.n*l0.classes*sizeof(int));
+    box * bboxes_cpu    = (box*)malloc(nBatchSize*nCells*l0.n*sizeof(box));
+    ck(cudaMemcpy(probes_cpu, probes, nBatchSize*nCells*l0.n*l0.classes*sizeof(float), cudaMemcpyDeviceToHost));
+    ck(cudaMemcpy(boxIdx_cpu, boxIdx, nBatchSize*nCells*l0.n*l0.classes*sizeof(int), cudaMemcpyDeviceToHost));
+    ck(cudaMemcpy(bboxes_cpu, bboxes, nBatchSize*nCells*l0.n*sizeof(box), cudaMemcpyDeviceToHost));
+
+    // output
+    int sizeOfClass = l0.n * nCells;
+    int sizeOfBatch = l0.classes * sizeOfClass;
+
+    for (int n=0; n<nBatchSize; ++n) {
+        int count = 0;
+        for (int i=0; i<sizeOfBatch; ++i){
+            int id = n * sizeOfBatch + i;
+            int indexes_idx = boxIdx_cpu[id];
+
+            if (probes_cpu[id]){
+                int category = (indexes_idx % sizeOfBatch) / sizeOfClass;
+                int boxId = indexes_idx % sizeOfClass;
+                box b = bboxes_cpu[boxId];
+
+                int xmin = (b.x-b.w/2.)*im.w + 1;
+                int xmax = (b.x+b.w/2.)*im.w + 1;
+                int ymin = (b.y-b.h/2.)*im.h + 1;
+                int ymax = (b.y+b.h/2.)*im.h + 1;
+			          if (xmin < 1) xmin = 1;
+			          if (ymin < 1) ymin = 1;
+			          if (xmax > im.w) xmax = im.w;
+			          if (ymax > im.h) ymax = im.h;
+
+#ifdef PRINT_LOG
+                LOG_DEBUG(logger, " Batch " << n << ":");
+                LOG_DEBUG(logger, "     Obj[" << count << "]:");
+                LOG_DEBUG(logger, "         Category: " << vSynsets[category].c_str());
+                LOG_DEBUG(logger, "         Prob: " << probes_cpu[id] * 100.f << "%");
+                LOG_DEBUG(logger, "         BBOX: [" << xmin << ", "
+                                                    << ymin << ", "
+                                                    << xmax << ", "
+                                                    << ymax << "]");
+#endif
+                count ++;
+#ifdef cal_mAP
+                
+                std::ofstream ofs;
+					      std::string outputName = "results/comp4_det_test_" + vSynsets[category] + ".txt";
+					      ofs.open(outputName.c_str(), std::ofstream::out | std::ofstream::app);
+					      ofs << imageIndex << " " 
+							      << std::setiosflags(std::ios::fixed) << probes_cpu[id] << " "
+							      << std::setiosflags(std::ios::fixed) << xmin << " "
+							      << std::setiosflags(std::ios::fixed) << ymin << " "
+							      << std::setiosflags(std::ios::fixed) << xmax << " "
+							      << std::setiosflags(std::ios::fixed) << ymax << std::endl;
+					      ofs.close();
+#endif
+            }
+        }
+    }
+
+#ifdef VISULIZATION
+	  draw_detections(im, 0, 0.3f, bboxes_cpu, probes_cpu, boxIdx_cpu, sizeOfClass, sizeOfBatch);
+    save_image(im, output.c_str());
+    LOG_DEBUG(logger, "Output image: " << output.c_str() << ".jpg");
+#endif
+
+    // free memories
+    free(probes_cpu);
+    free(boxIdx_cpu);
+    free(bboxes_cpu);
+
+    ck(cudaFree(boxIdx));
+    ck(cudaFree(afterNMS_probes));
+    ck(cudaFree(afterNMS_indexes));
+    ck(cudaFree(sorted_boxIdx));
+    ck(cudaFree(workspace));
+    ck(cudaFree(probes));
+    ck(cudaFree(bboxes));
+    ck(cudaFree(dpData));
+    // ck(cudaFree(dpData_unordered));
+    
+    ck(cudaStreamDestroy(stream));
+
+    return t;
+}
